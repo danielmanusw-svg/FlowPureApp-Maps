@@ -204,8 +204,10 @@ async function buildDe() {
   log("de", `done — wrote ${buckets.size} files`);
 }
 
-// US — OpenDataDE/State-zip-code-GeoJSON has per-state files. We shorten
-// names to `<state>.geojson` (e.g. `ca.geojson` from `ca_california_...min.json`).
+// US — OpenDataDE/State-zip-code-GeoJSON has per-state files, but we
+// consolidate then re-split by the ZIP code's first digit (10 buckets)
+// so the runtime parser doesn't need a ZIP→state lookup table. A user in
+// California (ZIP 902…) and Washington (ZIP 98…) both land in bucket `9`.
 async function buildUs() {
   const outDir = join(ROOT, "us");
   ensureDir(outDir);
@@ -218,19 +220,28 @@ async function buildUs() {
       state: f.name.slice(0, 2),
       download: f.download_url,
     }));
-  log("us", `${zipFiles.length} state files to mirror`);
+  log("us", `${zipFiles.length} state files to fetch + redistribute by first digit`);
 
+  const buckets = new Map(); // digit → features[]
   for (const { state, download } of zipFiles) {
     const text = await fetchText(download);
     const fc = JSON.parse(text);
     // OpenDataDE uses `ZCTA5CE10` for the ZIP property.
-    const features = fc.features
-      .map((f) => normalizeFeature(f, "ZCTA5CE10"))
-      .filter(Boolean);
-    writeFeatureCollection(join(outDir, `${state}.geojson`), features);
-    log("us", `  ${state}.geojson — ${features.length} ZIPs`);
+    for (const f of fc.features) {
+      const norm = normalizeFeature(f, "ZCTA5CE10");
+      if (!norm) continue;
+      const digit = norm.properties.name[0] ?? "0";
+      if (!buckets.has(digit)) buckets.set(digit, []);
+      buckets.get(digit).push(norm);
+    }
+    log("us", `  pulled ${state}`);
   }
-  log("us", `done — wrote ${zipFiles.length} files`);
+
+  for (const [digit, feats] of [...buckets.entries()].sort()) {
+    writeFeatureCollection(join(outDir, `${digit}.geojson`), feats);
+    log("us", `  ${digit}.geojson — ${feats.length} ZIPs`);
+  }
+  log("us", `done — wrote ${buckets.size} files`);
 }
 
 // NL — PC4 polygons from Opendatasoft's georef dataset. One file, ~4,000 areas.
