@@ -1,0 +1,24 @@
+{
+  "name": "flowpureapp-maps",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danielmanusw-svg/FlowPureApp-Maps.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/danielmanusw-svg/FlowPureApp-Maps/issues"
+  },
+  "homepage": "https://github.com/danielmanusw-svg/FlowPureApp-Maps#readme",
+  "dependencies": {
+    "@turf/simplify": "^7.3.5"
+  }
+}
