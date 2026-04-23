@@ -302,6 +302,219 @@ async function buildDk() {
   log("dk", `done — wrote postnumre.geojson with ${features.length} codes`);
 }
 
+// ─── Region-outline builders (fallback polygons) ──────────────────────────
+//
+// These produce a single `<country>/regions.geojson` holding broad
+// admin-region polygons (states / Bundesländer / provinces / regions),
+// used by the app when an exact postcode polygon isn't available.
+// Every feature is normalised to `properties.name = <short region code>`.
+
+// Merges features sharing the same `properties.name` into a single
+// MultiPolygon. Used when source data ships islands as separate features.
+function mergeByName(features) {
+  const byName = new Map();
+  for (const f of features) {
+    const n = f.properties?.name;
+    if (!n) continue;
+    if (!byName.has(n)) byName.set(n, []);
+    byName.get(n).push(f);
+  }
+  return [...byName.entries()].map(([name, feats]) => {
+    if (feats.length === 1) return feats[0];
+    const coords = [];
+    for (const f of feats) {
+      const g = f.geometry;
+      if (!g) continue;
+      if (g.type === "Polygon") coords.push(g.coordinates);
+      else if (g.type === "MultiPolygon") coords.push(...g.coordinates);
+    }
+    return {
+      type: "Feature",
+      properties: { name },
+      geometry: { type: "MultiPolygon", coordinates: coords },
+    };
+  });
+}
+
+// AU — 8 states + territories. Source property STATE_NAME maps to our
+// short lowercase codes (nsw, vic, …).
+async function buildAuRegions() {
+  const AU_NAME_TO_CODE = {
+    "New South Wales": "nsw",
+    "Victoria": "vic",
+    "Queensland": "qld",
+    "South Australia": "sa",
+    "Western Australia": "wa",
+    "Tasmania": "tas",
+    "Northern Territory": "nt",
+    "Australian Capital Territory": "act",
+  };
+  log("au-regions", "downloading state outlines…");
+  const fc = await fetchJson(
+    "https://raw.githubusercontent.com/rowanhogan/australian-states/master/states.geojson"
+  );
+  const features = fc.features
+    .map((f) => {
+      const code = AU_NAME_TO_CODE[f.properties?.STATE_NAME];
+      if (!code) return null;
+      return simplifyFeature({
+        type: "Feature",
+        properties: { name: code },
+        geometry: f.geometry,
+      });
+    })
+    .filter(Boolean);
+  writeFeatureCollection(join(ROOT, "au", "regions.geojson"), features);
+  log("au-regions", `done — ${features.length} state outlines`);
+}
+
+// DE — 16 Bundesländer. Source `id` is ISO 3166-2 like "DE-BW"; we strip
+// the prefix and lowercase to `bw`.
+async function buildDeRegions() {
+  log("de-regions", "downloading Bundesländer outlines…");
+  const fc = await fetchJson(
+    "https://raw.githubusercontent.com/isellsoap/deutschlandGeoJSON/master/2_bundeslaender/4_niedrig.geo.json"
+  );
+  const features = fc.features
+    .map((f) => {
+      const id = f.properties?.id ?? "";
+      const code = id.replace(/^DE-/, "").toLowerCase();
+      if (!code) return null;
+      return simplifyFeature({
+        type: "Feature",
+        properties: { name: code },
+        geometry: f.geometry,
+      });
+    })
+    .filter(Boolean);
+  writeFeatureCollection(join(ROOT, "de", "regions.geojson"), features);
+  log("de-regions", `done — ${features.length} Bundesländer`);
+}
+
+// US — 50 states + DC. Source uses `name` with full state name; we map to
+// 2-letter USPS codes. We also emit `us/zip3-state.json`, a
+// ZIP-first-3-digits → state-code lookup derived from the zip files we
+// already built, so the app can resolve a user's state from their ZIP.
+const US_STATE_NAME_TO_CODE = {
+  Alabama: "al", Alaska: "ak", Arizona: "az", Arkansas: "ar",
+  California: "ca", Colorado: "co", Connecticut: "ct", Delaware: "de",
+  "District of Columbia": "dc", Florida: "fl", Georgia: "ga", Hawaii: "hi",
+  Idaho: "id", Illinois: "il", Indiana: "in", Iowa: "ia",
+  Kansas: "ks", Kentucky: "ky", Louisiana: "la", Maine: "me",
+  Maryland: "md", Massachusetts: "ma", Michigan: "mi", Minnesota: "mn",
+  Mississippi: "ms", Missouri: "mo", Montana: "mt", Nebraska: "ne",
+  Nevada: "nv", "New Hampshire": "nh", "New Jersey": "nj",
+  "New Mexico": "nm", "New York": "ny", "North Carolina": "nc",
+  "North Dakota": "nd", Ohio: "oh", Oklahoma: "ok", Oregon: "or",
+  Pennsylvania: "pa", "Rhode Island": "ri", "South Carolina": "sc",
+  "South Dakota": "sd", Tennessee: "tn", Texas: "tx", Utah: "ut",
+  Vermont: "vt", Virginia: "va", Washington: "wa", "West Virginia": "wv",
+  Wisconsin: "wi", Wyoming: "wy", "Puerto Rico": "pr",
+};
+
+async function buildUsRegions() {
+  log("us-regions", "downloading state outlines…");
+  const fc = await fetchJson(
+    "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
+  );
+  const features = fc.features
+    .map((f) => {
+      const code = US_STATE_NAME_TO_CODE[f.properties?.name];
+      if (!code) return null;
+      return simplifyFeature({
+        type: "Feature",
+        properties: { name: code },
+        geometry: f.geometry,
+      });
+    })
+    .filter(Boolean);
+  writeFeatureCollection(join(ROOT, "us", "regions.geojson"), features);
+  log("us-regions", `done — ${features.length} state outlines`);
+
+  // Derive ZIP3 → state mapping from the already-built us/*.geojson files.
+  // Uses the ORIGINAL OpenDataDE sources (re-fetched) so we have state info.
+  log("us-regions", "building zip3→state index…");
+  const api = "https://api.github.com/repos/OpenDataDE/State-zip-code-GeoJSON/contents/";
+  const listing = await fetchJson(api);
+  const zipFiles = listing
+    .filter((f) => f.name.endsWith("_zip_codes_geo.min.json"))
+    .map((f) => ({ state: f.name.slice(0, 2), download: f.download_url }));
+
+  const zip3Map = {};
+  for (const { state, download } of zipFiles) {
+    const text = await fetchText(download);
+    const j = JSON.parse(text);
+    for (const f of j.features) {
+      const zip = String(f.properties?.ZCTA5CE10 ?? "").padStart(5, "0");
+      if (zip.length !== 5) continue;
+      const prefix = zip.slice(0, 3);
+      // Don't overwrite — first state to claim a ZIP3 wins. (Rare that
+      // a ZIP3 spans states; picking the first is an acceptable approximation.)
+      if (!zip3Map[prefix]) zip3Map[prefix] = state;
+    }
+  }
+  writeFileSync(join(ROOT, "us", "zip3-state.json"), JSON.stringify(zip3Map));
+  log("us-regions", `done — ${Object.keys(zip3Map).length} zip3 prefixes`);
+}
+
+// NL — 12 provinces. Source `statnaam` is the province name; we map to
+// 2-letter abbreviations.
+async function buildNlRegions() {
+  const NL_NAME_TO_CODE = {
+    Groningen: "gr", Fryslân: "fr", Friesland: "fr", Drenthe: "dr",
+    Overijssel: "ov", Flevoland: "fl", Gelderland: "ge", Utrecht: "ut",
+    "Noord-Holland": "nh", "Zuid-Holland": "zh", Zeeland: "ze",
+    "Noord-Brabant": "nb", Limburg: "li",
+  };
+  log("nl-regions", "downloading province outlines…");
+  const fc = await fetchJson(
+    "https://cartomap.github.io/nl/wgs84/provincie_2023.geojson"
+  );
+  const features = fc.features
+    .map((f) => {
+      const code = NL_NAME_TO_CODE[f.properties?.statnaam];
+      if (!code) return null;
+      return simplifyFeature({
+        type: "Feature",
+        properties: { name: code },
+        geometry: f.geometry,
+      });
+    })
+    .filter(Boolean);
+  writeFeatureCollection(join(ROOT, "nl", "regions.geojson"), features);
+  log("nl-regions", `done — ${features.length} provinces`);
+}
+
+// DK — 5 regions. Source has 222 island-split features; we merge by region
+// code into 5 MultiPolygon entries.
+async function buildDkRegions() {
+  const DK_CODE_TO_SHORT = {
+    "1084": "hovedstaden",
+    "1081": "nordjylland",
+    "1083": "syddanmark",
+    "1085": "sjaelland",
+    "1082": "midtjylland",
+  };
+  log("dk-regions", "downloading region outlines…");
+  const fc = await fetchJson(
+    "https://raw.githubusercontent.com/Neogeografen/dagi/master/geojson/regioner.geojson"
+  );
+  const simplified = fc.features
+    .map((f) => {
+      const short = DK_CODE_TO_SHORT[f.properties?.REGIONKODE];
+      if (!short) return null;
+      return simplifyFeature({
+        type: "Feature",
+        properties: { name: short },
+        geometry: f.geometry,
+      });
+    })
+    .filter(Boolean);
+  const merged = mergeByName(simplified);
+  writeFeatureCollection(join(ROOT, "dk", "regions.geojson"), merged);
+  log("dk-regions", `done — ${merged.length} regions (from ${simplified.length} island pieces)`);
+}
+
 // ─── Entry ────────────────────────────────────────────────────────────────
 
 const BUILDERS = {
@@ -311,6 +524,18 @@ const BUILDERS = {
   us: buildUs,
   nl: buildNl,
   dk: buildDk,
+  "au-regions": buildAuRegions,
+  "de-regions": buildDeRegions,
+  "us-regions": buildUsRegions,
+  "nl-regions": buildNlRegions,
+  "dk-regions": buildDkRegions,
+  regions: async () => {
+    await buildAuRegions();
+    await buildDeRegions();
+    await buildUsRegions();
+    await buildNlRegions();
+    await buildDkRegions();
+  },
 };
 
 async function main() {
