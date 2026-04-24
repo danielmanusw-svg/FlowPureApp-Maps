@@ -19,6 +19,9 @@
   },
   "homepage": "https://github.com/danielmanusw-svg/FlowPureApp-Maps#readme",
   "dependencies": {
+    "@turf/bbox": "^7.3.5",
+    "@turf/boolean-point-in-polygon": "^7.3.5",
+    "@turf/centroid": "^7.3.5",
     "@turf/simplify": "^7.3.5"
   }
 }

@@ -6,13 +6,16 @@
 // Each country ends up with GeoJSON files under ./<country>/ where every
 // feature has `properties.name = <postcode>`. Files are minified JSON.
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createBrotliDecompress } from "node:zlib";
 import { pipeline } from "node:stream/promises";
 import { Readable, PassThrough } from "node:stream";
 import simplify from "@turf/simplify";
+import centroid from "@turf/centroid";
+import booleanPointInPolygon from "@turf/boolean-point-in-polygon";
+import bbox from "@turf/bbox";
 
 // Geometry simplification tolerance (degrees). 0.0005 ≈ 55 m at the
 // equator — plenty of fidelity for a phone map, dramatically smaller files.
@@ -515,6 +518,213 @@ async function buildDkRegions() {
   log("dk-regions", `done — ${merged.length} regions (from ${simplified.length} island pieces)`);
 }
 
+// ─── Admin-tier fallback builders (counties / LGAs / Kreise / LADs) ──────
+//
+// For each country these build a `<country>/admin.geojson` with finer-grain
+// admin polygons and a `<country>/admin-lookup.json` mapping every known
+// postcode to its admin area. The lookup is auto-derived by checking which
+// admin polygon contains each postcode feature's centroid.
+
+// Box-index optimisation — without this, spatial-joining 33k ZIPs against
+// 3k counties is O(100M) which is too slow. We pre-compute each admin
+// polygon's bounding box and filter candidates by bbox before running the
+// exact point-in-polygon test.
+function indexAdmin(adminFeatures) {
+  return adminFeatures.map((f) => {
+    const [minX, minY, maxX, maxY] = bbox(f);
+    return { f, minX, minY, maxX, maxY };
+  });
+}
+
+function findContainingAdmin(point, index) {
+  const coords = point?.geometry?.coordinates;
+  if (!coords || !Number.isFinite(coords[0]) || !Number.isFinite(coords[1])) {
+    return null;
+  }
+  const [x, y] = coords;
+  for (const e of index) {
+    if (x < e.minX || x > e.maxX || y < e.minY || y > e.maxY) continue;
+    try {
+      if (booleanPointInPolygon(point, e.f)) return e.f;
+    } catch {
+      // Malformed admin polygon — skip this one, try the next.
+    }
+  }
+  return null;
+}
+
+// Given a country's existing postcode files + a set of admin features,
+// build and write `<country>/admin-lookup.json` mapping postcode → admin
+// code. Returns counts for the log output.
+function buildAdminLookup(country, countryFolder, postcodeFiles, adminFeatures) {
+  const index = indexAdmin(adminFeatures);
+  const lookup = {};
+  let matched = 0;
+  let unmatched = 0;
+
+  for (const file of postcodeFiles) {
+    const path = join(ROOT, countryFolder, file);
+    if (!existsSync(path)) continue;
+    const fc = JSON.parse(readFileSync(path, "utf8"));
+    for (const pc of fc.features) {
+      const code = pc.properties?.name;
+      if (!code) continue;
+      let c;
+      try {
+        c = centroid(pc);
+      } catch {
+        unmatched++;
+        continue;
+      }
+      const admin = findContainingAdmin(c, index);
+      if (admin) {
+        lookup[code] = admin.properties.name;
+        matched++;
+      } else {
+        unmatched++;
+      }
+    }
+  }
+
+  writeFileSync(
+    join(ROOT, countryFolder, "admin-lookup.json"),
+    JSON.stringify(lookup)
+  );
+  log(country, `  admin-lookup.json — ${matched} matched, ${unmatched} unmatched`);
+  return { matched, unmatched };
+}
+
+// Helper: slugify an admin-region display name to a lowercase code with
+// hyphens, safe as a URL-friendly feature id.
+function slug(str) {
+  return String(str)
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "") // strip accents
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+// AU — ~565 LGAs from thomjoy/aus-lga. Property LGA_NAME11 holds names
+// like "Albury (C)"; we slug them (e.g. "albury-c") for feature IDs.
+async function buildAuAdmin() {
+  log("au-admin", "downloading LGA boundaries…");
+  const fc = await fetchJson(
+    "https://raw.githubusercontent.com/thomjoy/aus-lga/master/data/aus_lga.json"
+  );
+  const nameByCode = new Map();
+  const features = fc.features
+    .map((f) => {
+      const display = f.properties?.LGA_NAME11;
+      if (!display) return null;
+      const code = slug(display);
+      if (!code) return null;
+      nameByCode.set(code, display);
+      return simplifyFeature({
+        type: "Feature",
+        properties: { name: code, displayName: display },
+        geometry: f.geometry,
+      });
+    })
+    .filter(Boolean);
+  writeFeatureCollection(join(ROOT, "au", "admin.geojson"), features);
+  log("au-admin", `  admin.geojson — ${features.length} LGAs`);
+
+  // Build the postcode → LGA lookup. AU postcodes live in au/0…9.geojson
+  // except the stray Z.geojson; ignore that one.
+  const postcodeFiles = ["0", "2", "3", "4", "5", "6", "7", "9"].map((d) => `${d}.geojson`);
+  buildAdminLookup("au-admin", "au", postcodeFiles, features);
+  log("au-admin", "done");
+}
+
+// DE — ~434 Kreise from isellsoap/deutschlandGeoJSON. The GADM-derived
+// file carries NAME_3 for the Kreis name (e.g. "München").
+async function buildDeAdmin() {
+  log("de-admin", "downloading Kreis boundaries…");
+  const fc = await fetchJson(
+    "https://raw.githubusercontent.com/isellsoap/deutschlandGeoJSON/main/4_kreise/4_niedrig.geo.json"
+  );
+  const features = fc.features
+    .map((f) => {
+      const display = f.properties?.NAME_3;
+      if (!display) return null;
+      const code = slug(display);
+      if (!code) return null;
+      return simplifyFeature({
+        type: "Feature",
+        properties: { name: code, displayName: display },
+        geometry: f.geometry,
+      });
+    })
+    .filter(Boolean);
+  writeFeatureCollection(join(ROOT, "de", "admin.geojson"), features);
+  log("de-admin", `  admin.geojson — ${features.length} Kreise`);
+
+  const postcodeFiles = ["0","1","2","3","4","5","6","7","8","9"].map((d) => `${d}.geojson`);
+  buildAdminLookup("de-admin", "de", postcodeFiles, features);
+  log("de-admin", "done");
+}
+
+// UK — 380 Local Authority Districts from martinjc/UK-GeoJSON. LAD13CD
+// is the official ONS code (e.g. "E06000001"); we lowercase it.
+async function buildGbAdmin() {
+  log("gb-admin", "downloading LAD boundaries…");
+  const fc = await fetchJson(
+    "https://raw.githubusercontent.com/martinjc/UK-GeoJSON/master/json/administrative/gb/lad.json"
+  );
+  const features = fc.features
+    .map((f) => {
+      const displayName = f.properties?.LAD13NM;
+      const code = (f.properties?.LAD13CD ?? "").toLowerCase();
+      if (!code || !displayName) return null;
+      return simplifyFeature({
+        type: "Feature",
+        properties: { name: code, displayName },
+        geometry: f.geometry,
+      });
+    })
+    .filter(Boolean);
+  writeFeatureCollection(join(ROOT, "gb", "admin.geojson"), features);
+  log("gb-admin", `  admin.geojson — ${features.length} LADs`);
+
+  // GB postcode files are the 120 area files we mirrored from missinglink.
+  // Walk them all from the directory rather than enumerating.
+  const postcodeFiles = readdirSync(join(ROOT, "gb")).filter(
+    (f) => f.endsWith(".geojson") && f !== "admin.geojson" && f !== "regions.geojson"
+  );
+  buildAdminLookup("gb-admin", "gb", postcodeFiles, features);
+  log("gb-admin", "done");
+}
+
+// US — 3,221 counties from plotly/datasets. GEO_ID like "0500000US01001"
+// where the last 5 chars are state-FIPS + county-FIPS; we use that suffix
+// as the code (e.g. "01001" for Autauga, AL).
+async function buildUsAdmin() {
+  log("us-admin", "downloading county boundaries (~10 MB)…");
+  const fc = await fetchJson(
+    "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
+  );
+  const features = fc.features
+    .map((f) => {
+      const geoId = String(f.properties?.GEO_ID ?? "");
+      const code = geoId.slice(-5); // 5-digit FIPS
+      const displayName = f.properties?.NAME;
+      if (!code || !displayName) return null;
+      return simplifyFeature({
+        type: "Feature",
+        properties: { name: code, displayName },
+        geometry: f.geometry,
+      });
+    })
+    .filter(Boolean);
+  writeFeatureCollection(join(ROOT, "us", "admin.geojson"), features);
+  log("us-admin", `  admin.geojson — ${features.length} counties`);
+
+  const postcodeFiles = ["0","1","2","3","4","5","6","7","8","9"].map((d) => `${d}.geojson`);
+  buildAdminLookup("us-admin", "us", postcodeFiles, features);
+  log("us-admin", "done");
+}
+
 // ─── Entry ────────────────────────────────────────────────────────────────
 
 const BUILDERS = {
@@ -535,6 +745,16 @@ const BUILDERS = {
     await buildUsRegions();
     await buildNlRegions();
     await buildDkRegions();
+  },
+  "au-admin": buildAuAdmin,
+  "de-admin": buildDeAdmin,
+  "gb-admin": buildGbAdmin,
+  "us-admin": buildUsAdmin,
+  admin: async () => {
+    await buildAuAdmin();
+    await buildDeAdmin();
+    await buildGbAdmin();
+    await buildUsAdmin();
   },
 };
 
