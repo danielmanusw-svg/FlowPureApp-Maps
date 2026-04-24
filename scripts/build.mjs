@@ -555,12 +555,24 @@ function findContainingAdmin(point, index) {
 
 // Given a country's existing postcode files + a set of admin features,
 // build and write `<country>/admin-lookup.json` mapping postcode → admin
-// code. Returns counts for the log output.
-function buildAdminLookup(country, countryFolder, postcodeFiles, adminFeatures) {
+// code. ALSO emits prefix entries (keys "p:<digits>") so postcodes we
+// don't have exact data for can still resolve to the most-common admin
+// area for their prefix. Prefix lengths depend on the country's postcode
+// size — e.g. AU (4-digit) gets prefixes of length 1/2/3.
+function buildAdminLookup(
+  country,
+  countryFolder,
+  postcodeFiles,
+  adminFeatures,
+  { prefixLengths = [] } = {}
+) {
   const index = indexAdmin(adminFeatures);
   const lookup = {};
   let matched = 0;
   let unmatched = 0;
+  // For prefix aggregation: for each prefix length, count admin occurrences
+  // so we can pick the mode.
+  const prefixCounts = new Map(); // `${len}:${prefix}` → Map<adminCode, count>
 
   for (const file of postcodeFiles) {
     const path = join(ROOT, countryFolder, file);
@@ -578,11 +590,39 @@ function buildAdminLookup(country, countryFolder, postcodeFiles, adminFeatures) 
       }
       const admin = findContainingAdmin(c, index);
       if (admin) {
-        lookup[code] = admin.properties.name;
+        const adminCode = admin.properties.name;
+        lookup[code] = adminCode;
         matched++;
+        // Tally for each requested prefix length.
+        for (const len of prefixLengths) {
+          if (code.length < len) continue;
+          const prefix = code.slice(0, len);
+          const key = `${len}:${prefix}`;
+          if (!prefixCounts.has(key)) prefixCounts.set(key, new Map());
+          const inner = prefixCounts.get(key);
+          inner.set(adminCode, (inner.get(adminCode) ?? 0) + 1);
+        }
       } else {
         unmatched++;
       }
+    }
+  }
+
+  // Pick mode per prefix and emit `p:<prefix>` keys.
+  let prefixesAdded = 0;
+  for (const [key, adminCounts] of prefixCounts) {
+    const prefix = key.split(":")[1];
+    let winner = null;
+    let winnerCount = 0;
+    for (const [adminCode, count] of adminCounts) {
+      if (count > winnerCount) {
+        winner = adminCode;
+        winnerCount = count;
+      }
+    }
+    if (winner) {
+      lookup[`p:${prefix}`] = winner;
+      prefixesAdded++;
     }
   }
 
@@ -590,8 +630,11 @@ function buildAdminLookup(country, countryFolder, postcodeFiles, adminFeatures) 
     join(ROOT, countryFolder, "admin-lookup.json"),
     JSON.stringify(lookup)
   );
-  log(country, `  admin-lookup.json — ${matched} matched, ${unmatched} unmatched`);
-  return { matched, unmatched };
+  log(
+    country,
+    `  admin-lookup.json — ${matched} exact, ${prefixesAdded} prefix, ${unmatched} unmatched`
+  );
+  return { matched, unmatched, prefixesAdded };
 }
 
 // Helper: slugify an admin-region display name to a lowercase code with
@@ -633,7 +676,9 @@ async function buildAuAdmin() {
   // Build the postcode → LGA lookup. AU postcodes live in au/0…9.geojson
   // except the stray Z.geojson; ignore that one.
   const postcodeFiles = ["0", "2", "3", "4", "5", "6", "7", "9"].map((d) => `${d}.geojson`);
-  buildAdminLookup("au-admin", "au", postcodeFiles, features);
+  buildAdminLookup("au-admin", "au", postcodeFiles, features, {
+    prefixLengths: [1, 2, 3], // 4-digit postcodes → try 3, 2, 1
+  });
   log("au-admin", "done");
 }
 
@@ -661,7 +706,9 @@ async function buildDeAdmin() {
   log("de-admin", `  admin.geojson — ${features.length} Kreise`);
 
   const postcodeFiles = ["0","1","2","3","4","5","6","7","8","9"].map((d) => `${d}.geojson`);
-  buildAdminLookup("de-admin", "de", postcodeFiles, features);
+  buildAdminLookup("de-admin", "de", postcodeFiles, features, {
+    prefixLengths: [1, 2, 3, 4], // 5-digit PLZ → prefixes 4/3/2/1
+  });
   log("de-admin", "done");
 }
 
@@ -692,7 +739,11 @@ async function buildGbAdmin() {
   const postcodeFiles = readdirSync(join(ROOT, "gb")).filter(
     (f) => f.endsWith(".geojson") && f !== "admin.geojson" && f !== "regions.geojson"
   );
-  buildAdminLookup("gb-admin", "gb", postcodeFiles, features);
+  // GB district codes are letter(s)+digit(s), e.g. "SE10". Prefix
+  // lengths 2 (the "outward area") and 3 cover most cases usefully.
+  buildAdminLookup("gb-admin", "gb", postcodeFiles, features, {
+    prefixLengths: [1, 2, 3],
+  });
   log("gb-admin", "done");
 }
 
@@ -721,7 +772,9 @@ async function buildUsAdmin() {
   log("us-admin", `  admin.geojson — ${features.length} counties`);
 
   const postcodeFiles = ["0","1","2","3","4","5","6","7","8","9"].map((d) => `${d}.geojson`);
-  buildAdminLookup("us-admin", "us", postcodeFiles, features);
+  buildAdminLookup("us-admin", "us", postcodeFiles, features, {
+    prefixLengths: [1, 2, 3, 4], // 5-digit ZIPs; ZIP3 is the classic USPS unit
+  });
   log("us-admin", "done");
 }
 
